@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,6 +27,7 @@ MAX_FRACTION = min(max(float(os.getenv("MAX_CAPITAL_FRACTION_PER_TRADE", "0.10")
 MAX_QUOTE_PER_TRADE = max(5.0, float(os.getenv("MAX_QUOTE_PER_TRADE", "50")))
 MIN_QUOTE_PER_TRADE = max(5.0, float(os.getenv("MIN_QUOTE_PER_TRADE", "5")))
 MAX_DAILY_LOSS_PCT = min(max(float(os.getenv("MAX_DAILY_LOSS_PCT", "2.0")), 0.5), 3.0)
+MAX_TRADES_PER_DAY = min(max(int(os.getenv("MAX_TRADES_PER_DAY", "6")), 1), 20)
 STOP_ATR = min(max(float(os.getenv("STOP_ATR_MULT", "1.6")), 0.8), 3.0)
 TP_ATR = min(max(float(os.getenv("TAKE_PROFIT_ATR_MULT", "2.8")), 1.2), 6.0)
 TRAIL_ATR = min(max(float(os.getenv("TRAILING_ATR_MULT", "1.1")), 0.5), 3.0)
@@ -35,7 +37,7 @@ MAX_HOLD_HOURS = max(1, int(os.getenv("MAX_HOLD_HOURS", "24")))
 if BOT_MODE not in {"paper", "testnet"}:
     raise RuntimeError("Safety lock: BOT_MODE supports only 'paper' or 'testnet'. Live/mainnet is intentionally unavailable.")
 
-app = FastAPI(title="Khafi Spot Bot v3.1")
+app = FastAPI(title="Khafi Spot Bot v3.2")
 
 exchange_args: dict[str, Any] = {
     "enableRateLimit": True,
@@ -49,8 +51,10 @@ if BOT_MODE == "testnet":
     # Hard safety boundary: every Binance call goes to Spot Testnet in testnet mode.
     ex.set_sandbox_mode(True)
 
+STARTED_AT = datetime.now(timezone.utc)
+
 state: dict[str, Any] = {
-    "version": "v3.1",
+    "version": "v3.2",
     "mode": BOT_MODE,
     "execution_enabled": EXECUTE_TESTNET_ORDERS if BOT_MODE == "testnet" else False,
     "status": "starting",
@@ -61,27 +65,63 @@ state: dict[str, Any] = {
     "position": None,
     "last_signal": None,
     "last_trade_at": None,
+    "last_scan_at": None,
+    "loop_count": 0,
     "trades": [],
     "errors": [],
     "stats": {"wins": 0, "losses": 0, "closed": 0, "gross_profit": 0.0, "gross_loss": 0.0},
+    "risk": {"bot_buys_today": 0, "max_trades_per_day": MAX_TRADES_PER_DAY},
     "auth": {
         "configured": bool(API_KEY and API_SECRET),
         "checked": False,
         "ok": False,
         "read_only_check": True,
     },
+    "recovery": {
+        "checked": BOT_MODE != "testnet",
+        "ok": BOT_MODE != "testnet",
+        "safe_to_trade": BOT_MODE != "testnet",
+        "bot_orders_found": 0,
+        "recovered_position": False,
+    },
     "preflight": {"ok": False, "symbols": {}, "auth_configured": bool(API_KEY and API_SECRET)},
 }
 
 task: asyncio.Task | None = None
+_last_signal_log_key: str | None = None
+_last_signal_log_at = 0.0
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def iso_from_ms(ms: Any) -> str | None:
+    try:
+        if ms is None:
+            return None
+        return datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def client_order_id(side: str) -> str:
+    # Binance clientOrderId max length is comfortably above this short tag.
+    stamp = int(time.time() * 1000)
+    return f"khafi_{side}_{stamp}"
+
+
+def order_client_id(order: dict[str, Any]) -> str:
+    info = order.get("info") or {}
+    return str(order.get("clientOrderId") or info.get("clientOrderId") or info.get("origClientOrderId") or "")
+
+
+def is_khafi_order(order: dict[str, Any]) -> bool:
+    return order_client_id(order).startswith("khafi_")
 
 
 def ema_series(values: list[float], span: int) -> list[float]:
@@ -255,6 +295,17 @@ def daily_loss_pct() -> float:
     return max(0.0, -float(state["realized_pnl"])) / base * 100.0
 
 
+def testnet_execution_allowed() -> bool:
+    if BOT_MODE != "testnet":
+        return False
+    return bool(
+        EXECUTE_TESTNET_ORDERS
+        and state["auth"].get("ok")
+        and state["recovery"].get("ok")
+        and state["recovery"].get("safe_to_trade")
+    )
+
+
 async def paper_enter(sig: dict[str, Any]):
     alloc = min(float(state["paper_balance"]) * MAX_FRACTION, MAX_QUOTE_PER_TRADE)
     if alloc < MIN_QUOTE_PER_TRADE:
@@ -275,11 +326,11 @@ async def paper_enter(sig: dict[str, Any]):
 
 
 async def testnet_enter(sig: dict[str, Any]):
-    if not EXECUTE_TESTNET_ORDERS:
-        state["status"] = "testnet_signal_only"
+    if not testnet_execution_allowed():
+        state["status"] = "testnet_execution_safety_block"
         return
-    if not state["auth"].get("ok"):
-        state["status"] = "testnet_auth_not_verified"
+    if int(state["risk"].get("bot_buys_today", 0)) >= MAX_TRADES_PER_DAY:
+        state["status"] = "max_trades_per_day_lock"
         return
 
     market = ex.market(sig["symbol"])
@@ -298,7 +349,8 @@ async def testnet_enter(sig: dict[str, Any]):
         state["status"] = "testnet_bad_order_amount"
         return
 
-    order = await ex.create_market_buy_order(sig["symbol"], amount)
+    cid = client_order_id("b")
+    order = await ex.create_market_buy_order(sig["symbol"], amount, {"newClientOrderId": cid})
     filled = float(order.get("filled") or amount)
     avg = float(order.get("average") or px)
     if filled <= 0:
@@ -309,10 +361,14 @@ async def testnet_enter(sig: dict[str, Any]):
         "symbol": sig["symbol"], "entry": avg, "base": filled, "spent": filled * avg,
         "atr": sig["atr"], "stop": avg - STOP_ATR * sig["atr"], "tp": avg + TP_ATR * sig["atr"],
         "highest": avg, "opened": now_iso(), "trail": False, "venue": "binance_spot_testnet",
-        "order_id": order.get("id"),
+        "order_id": order.get("id"), "client_order_id": cid, "recovered": False,
     }
     state["last_trade_at"] = now_iso()
-    state["trades"].append({"time": now_iso(), "type": "TESTNET_BUY", "symbol": sig["symbol"], "price": avg, "base": filled, "score": sig["score"]})
+    state["risk"]["bot_buys_today"] = int(state["risk"].get("bot_buys_today", 0)) + 1
+    state["trades"].append({
+        "time": now_iso(), "type": "TESTNET_BUY", "symbol": sig["symbol"],
+        "price": avg, "base": filled, "score": sig["score"], "client_order_id": cid,
+    })
 
 
 async def enter(sig: dict[str, Any]):
@@ -328,11 +384,21 @@ async def close_position(price: float, reason: str):
         return
 
     if p.get("venue") == "binance_spot_testnet":
-        if not EXECUTE_TESTNET_ORDERS or not state["auth"].get("ok"):
-            state["status"] = "testnet_exit_blocked"
+        if not testnet_execution_allowed():
+            state["status"] = "testnet_exit_safety_block"
             return
         amount = float(ex.amount_to_precision(p["symbol"], p["base"]))
-        await ex.create_market_sell_order(p["symbol"], amount)
+        if amount <= 0:
+            state["status"] = "testnet_exit_bad_amount"
+            return
+        cid = client_order_id("s")
+        order = await ex.create_market_sell_order(p["symbol"], amount, {"newClientOrderId": cid})
+        fill_price = float(order.get("average") or price)
+        filled = float(order.get("filled") or amount)
+        if filled <= 0:
+            state["status"] = "testnet_sell_not_filled"
+            return
+        price = fill_price
 
     proceeds = float(p["base"]) * price
     pnl = proceeds - float(p["spent"])
@@ -349,7 +415,10 @@ async def close_position(price: float, reason: str):
         st["losses"] += 1
         st["gross_loss"] += abs(pnl)
 
-    state["trades"].append({"time": now_iso(), "type": "EXIT", "symbol": p["symbol"], "price": price, "pnl": pnl, "reason": reason, "venue": p.get("venue")})
+    state["trades"].append({
+        "time": now_iso(), "type": "EXIT", "symbol": p["symbol"],
+        "price": price, "pnl": pnl, "reason": reason, "venue": p.get("venue"),
+    })
     state["last_trade_at"] = now_iso()
     state["position"] = None
 
@@ -378,14 +447,37 @@ async def manage_position():
         await close_position(price, "max_hold")
 
 
+async def maybe_log_signal(best: dict[str, Any]):
+    global _last_signal_log_key, _last_signal_log_at
+    key = f"{best.get('symbol')}:{best.get('score')}:{best.get('eligible')}"
+    now_mono = time.monotonic()
+    if key != _last_signal_log_key or (now_mono - _last_signal_log_at) >= 900:
+        safe = {
+            "symbol": best.get("symbol"),
+            "score": best.get("score"),
+            "eligible": best.get("eligible"),
+            "rsi": best.get("rsi"),
+            "volume_ratio": best.get("volume_ratio"),
+            "volatility_pct": best.get("volatility_pct"),
+        }
+        print(f"[khafi-signal] {safe}", flush=True)
+        _last_signal_log_key = key
+        _last_signal_log_at = now_mono
+
+
 async def scan():
+    state["last_scan_at"] = now_iso()
     if state["position"]:
+        state["status"] = "managing_position"
         return
     if cooldown_blocked():
         state["status"] = "cooldown"
         return
     if daily_loss_pct() >= MAX_DAILY_LOSS_PCT:
         state["status"] = "daily_loss_lock"
+        return
+    if BOT_MODE == "testnet" and int(state["risk"].get("bot_buys_today", 0)) >= MAX_TRADES_PER_DAY:
+        state["status"] = "max_trades_per_day_lock"
         return
 
     best = None
@@ -402,6 +494,7 @@ async def scan():
     if best:
         state["last_signal"] = best
         state["status"] = f"best:{best['symbol']}:{best['score']}"
+        await maybe_log_signal(best)
         if best.get("eligible"):
             await enter(best)
 
@@ -422,7 +515,7 @@ async def verify_testnet_auth() -> dict[str, Any]:
         return result
 
     try:
-        # fetch_balance is a private USER_DATA read. It does not create, cancel, buy or sell anything.
+        # USER_DATA read only: never creates, cancels, buys or sells anything.
         bal = await ex.fetch_balance()
         total = bal.get("total") or {}
         nonzero_assets = sum(1 for v in total.values() if isinstance(v, (int, float)) and float(v) != 0)
@@ -430,6 +523,122 @@ async def verify_testnet_auth() -> dict[str, Any]:
     except Exception as e:
         result.update({"checked": True, "ok": False, "error": f"{type(e).__name__}: {str(e)[:180]}"})
     return result
+
+
+async def recover_testnet_state() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "checked": True,
+        "ok": False,
+        "safe_to_trade": False,
+        "bot_orders_found": 0,
+        "recovered_position": False,
+    }
+    if BOT_MODE != "testnet":
+        result.update({"ok": True, "safe_to_trade": True, "reason": "not_testnet_mode"})
+        return result
+    if not state["auth"].get("ok"):
+        result["error"] = "auth_not_verified"
+        return result
+
+    try:
+        bot_orders: list[dict[str, Any]] = []
+        for sym in SYMBOLS:
+            try:
+                orders = await ex.fetch_orders(sym, limit=100)
+                for order in orders:
+                    if is_khafi_order(order):
+                        bot_orders.append(order)
+            except Exception as e:
+                result.setdefault("symbol_errors", {})[sym] = f"{type(e).__name__}: {str(e)[:120]}"
+
+        bot_orders.sort(key=lambda o: int(o.get("timestamp") or 0))
+        result["bot_orders_found"] = len(bot_orders)
+
+        # Restore cooldown and daily trade count from durable Binance Testnet order history.
+        if bot_orders:
+            last_order = bot_orders[-1]
+            state["last_trade_at"] = iso_from_ms(last_order.get("timestamp"))
+            result["last_bot_order_at"] = state["last_trade_at"]
+
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+        buys_today = 0
+        for order in bot_orders:
+            if (
+                str(order.get("side") or "").lower() == "buy"
+                and float(order.get("filled") or 0) > 0
+                and float(order.get("timestamp") or 0) >= day_start
+            ):
+                buys_today += 1
+        state["risk"]["bot_buys_today"] = buys_today
+
+        filled_orders = [
+            o for o in bot_orders
+            if float(o.get("filled") or 0) > 0
+            and str(o.get("status") or "").lower() in {"closed", "filled"}
+        ]
+        buys = [o for o in filled_orders if str(o.get("side") or "").lower() == "buy"]
+        sells = [o for o in filled_orders if str(o.get("side") or "").lower() == "sell"]
+        last_buy = max(buys, key=lambda o: int(o.get("timestamp") or 0), default=None)
+        last_sell = max(sells, key=lambda o: int(o.get("timestamp") or 0), default=None)
+
+        if last_buy and (
+            not last_sell
+            or int(last_buy.get("timestamp") or 0) > int(last_sell.get("timestamp") or 0)
+        ):
+            sym = str(last_buy.get("symbol") or "")
+            if sym not in SYMBOLS:
+                raise RuntimeError("Recovered order symbol is outside configured symbol allowlist.")
+
+            filled = float(last_buy.get("filled") or 0)
+            avg = float(last_buy.get("average") or 0)
+            cost = float(last_buy.get("cost") or 0)
+            if avg <= 0 and filled > 0 and cost > 0:
+                avg = cost / filled
+            if filled <= 0 or avg <= 0:
+                raise RuntimeError("Could not reconstruct the latest Khafi buy fill.")
+
+            d15 = await ohlcv(sym, "15m")
+            i15 = max(1, len(d15) - 2)
+            av = atr_at(d15, 14, i15)
+            if av <= 0:
+                ticker = await ex.fetch_ticker(sym)
+                px = float(ticker.get("last") or avg)
+                av = max(px * 0.005, 1e-9)
+
+            ticker = await ex.fetch_ticker(sym)
+            current = float(ticker.get("last") or avg)
+            opened = iso_from_ms(last_buy.get("timestamp")) or now_iso()
+            state["position"] = {
+                "symbol": sym,
+                "entry": avg,
+                "base": filled,
+                "spent": cost if cost > 0 else filled * avg,
+                "atr": av,
+                "stop": avg - STOP_ATR * av,
+                "tp": avg + TP_ATR * av,
+                "highest": max(avg, current),
+                "opened": opened,
+                "trail": current >= avg + TRAIL_ACTIVATE * av,
+                "venue": "binance_spot_testnet",
+                "order_id": last_buy.get("id"),
+                "client_order_id": order_client_id(last_buy),
+                "recovered": True,
+            }
+            result["recovered_position"] = True
+            result["recovered_symbol"] = sym
+
+        # If symbol reads failed entirely, do not allow new orders because recovery is uncertain.
+        symbol_errors = result.get("symbol_errors") or {}
+        if symbol_errors and len(symbol_errors) >= len(SYMBOLS):
+            result["error"] = "could_not_read_any_symbol_order_history"
+            return result
+
+        result["ok"] = True
+        result["safe_to_trade"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {str(e)[:220]}"
+        return result
 
 
 async def run_preflight():
@@ -462,14 +671,22 @@ async def run_preflight():
         if BOT_MODE == "testnet" and not state["auth"].get("ok"):
             pf["ok"] = False
             pf["auth_error"] = state["auth"].get("error", "auth_failed")
+
+        if BOT_MODE == "testnet" and state["auth"].get("ok"):
+            state["recovery"] = await recover_testnet_state()
+            pf["recovery_ok"] = state["recovery"].get("ok")
+            pf["recovered_position"] = state["recovery"].get("recovered_position")
+            if not state["recovery"].get("ok"):
+                pf["ok"] = False
+                pf["recovery_error"] = state["recovery"].get("error", "recovery_failed")
     except Exception as e:
         pf["ok"] = False
         pf["error"] = f"{type(e).__name__}: {str(e)[:220]}"
 
     state["preflight"] = pf
-    # Safe diagnostics only: no keys, no secrets, no balance amounts.
     print(f"[khafi-preflight] {pf}", flush=True)
     print(f"[khafi-auth] {state['auth']}", flush=True)
+    print(f"[khafi-recovery] {state['recovery']}", flush=True)
 
 
 async def loop():
@@ -477,11 +694,14 @@ async def loop():
     state["status"] = "running" if state["preflight"].get("ok") else "preflight_warning"
     while True:
         try:
+            state["loop_count"] += 1
             day = datetime.now(timezone.utc).date().isoformat()
             if state["day_key"] != day:
                 state["day_key"] = day
                 state["day_start_equity"] = state["paper_balance"] if BOT_MODE == "paper" else max(float(state["day_start_equity"]), 1.0)
                 state["realized_pnl"] = 0.0
+                if BOT_MODE != "testnet":
+                    state["risk"]["bot_buys_today"] = 0
             await manage_position()
             await scan()
         except asyncio.CancelledError:
@@ -490,6 +710,7 @@ async def loop():
             state["status"] = "error:" + type(e).__name__
             state["errors"].append({"time": now_iso(), "error": str(e)[:220]})
             state["errors"] = state["errors"][-30:]
+            print(f"[khafi-error] {type(e).__name__}: {str(e)[:220]}", flush=True)
         await asyncio.sleep(LOOP_SECONDS)
 
 
@@ -508,19 +729,24 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
+    uptime = int((datetime.now(timezone.utc) - STARTED_AT).total_seconds())
     return {
         "ok": True,
         "version": state["version"],
         "mode": BOT_MODE,
         "status": state["status"],
         "execution_enabled": state["execution_enabled"],
+        "execution_allowed": testnet_execution_allowed() if BOT_MODE == "testnet" else False,
         "auth_ok": state["auth"].get("ok"),
+        "recovery_ok": state["recovery"].get("ok"),
+        "recovered_position": state["recovery"].get("recovered_position"),
+        "uptime_seconds": uptime,
+        "last_scan_at": state["last_scan_at"],
     }
 
 
 @app.get("/auth-check")
 async def auth_check():
-    # Re-run the same read-only private authentication check on demand.
     state["auth"] = await verify_testnet_auth()
     return state["auth"]
 
@@ -528,6 +754,20 @@ async def auth_check():
 @app.get("/preflight")
 async def preflight():
     return state["preflight"]
+
+
+@app.get("/safety")
+async def safety():
+    return {
+        "mode": BOT_MODE,
+        "sandbox": BOT_MODE == "testnet",
+        "execution_enabled": state["execution_enabled"],
+        "execution_allowed": testnet_execution_allowed() if BOT_MODE == "testnet" else False,
+        "auth": state["auth"],
+        "recovery": state["recovery"],
+        "risk": state["risk"],
+        "mainnet_available": False,
+    }
 
 
 @app.get("/status")
@@ -538,7 +778,9 @@ async def status():
         "entry_score": ENTRY_SCORE,
         "max_fraction": MAX_FRACTION,
         "max_quote_per_trade": MAX_QUOTE_PER_TRADE,
+        "min_quote_per_trade": MIN_QUOTE_PER_TRADE,
         "max_daily_loss_pct": MAX_DAILY_LOSS_PCT,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
         "stop_atr": STOP_ATR,
         "take_profit_atr": TP_ATR,
         "trailing_atr": TRAIL_ATR,
@@ -553,20 +795,37 @@ async def home():
     sig = state["last_signal"]
     trades = state["trades"][-10:]
     st = state["stats"]
-    mode_label = "PAPER — no real orders" if BOT_MODE == "paper" else ("BINANCE SPOT TESTNET — execution ON" if EXECUTE_TESTNET_ORDERS else "BINANCE SPOT TESTNET — signal only")
+    execution_allowed = testnet_execution_allowed() if BOT_MODE == "testnet" else False
+    mode_label = (
+        "PAPER — no exchange orders"
+        if BOT_MODE == "paper"
+        else ("BINANCE SPOT TESTNET — execution ON" if EXECUTE_TESTNET_ORDERS else "BINANCE SPOT TESTNET — signal only")
+    )
     return f"""<!doctype html>
 <html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Khafi Spot Bot v3.1</title>
+<title>Khafi Spot Bot v3.2</title>
 <style>
-body{{font-family:system-ui;max-width:820px;margin:24px;background:#fafafa;color:#171717}}
+body{{font-family:system-ui;max-width:860px;margin:24px;background:#fafafa;color:#171717}}
 .card{{padding:16px;border:1px solid #ddd;border-radius:16px;background:white;margin:12px 0}}
 pre{{white-space:pre-wrap;word-break:break-word;font-size:12px}}
 </style></head><body>
-<h1>Khafi Spot Bot v3.1</h1>
-<div class='card'><b>Mode:</b> {mode_label}<br><b>Status:</b> {state['status']}<br><b>Symbols:</b> {', '.join(SYMBOLS)}<br><b>Preflight:</b> {state['preflight'].get('ok')}<br><b>API auth verified:</b> {state['auth'].get('ok')}</div>
-<div class='card'><b>Paper balance:</b> {state['paper_balance']:.2f}<br><b>Realized PnL:</b> {state['realized_pnl']:.4f}<br><b>Closed:</b> {st['closed']} &nbsp; <b>Wins:</b> {st['wins']} &nbsp; <b>Losses:</b> {st['losses']}</div>
+<h1>Khafi Spot Bot v3.2</h1>
+<div class='card'>
+<b>Mode:</b> {mode_label}<br>
+<b>Status:</b> {state['status']}<br>
+<b>Symbols:</b> {', '.join(SYMBOLS)}<br>
+<b>Preflight:</b> {state['preflight'].get('ok')}<br>
+<b>API auth verified:</b> {state['auth'].get('ok')}<br>
+<b>Restart recovery:</b> {state['recovery'].get('ok')}<br>
+<b>Execution safety gate:</b> {execution_allowed}
+</div>
+<div class='card'>
+<b>Bot buys today:</b> {state['risk'].get('bot_buys_today')} / {MAX_TRADES_PER_DAY}<br>
+<b>Realized PnL (current process):</b> {state['realized_pnl']:.4f}<br>
+<b>Closed (current process):</b> {st['closed']} &nbsp; <b>Wins:</b> {st['wins']} &nbsp; <b>Losses:</b> {st['losses']}
+</div>
 <div class='card'><h3>Open position</h3><pre>{p}</pre></div>
 <div class='card'><h3>Last signal</h3><pre>{sig}</pre></div>
-<div class='card'><h3>Last trades</h3><pre>{trades}</pre></div>
-<div class='card'><b>Safety lock:</b> live/mainnet trading does not exist in this build. Test execution is restricted to Binance Spot Testnet.</div>
+<div class='card'><h3>Last trades in current process</h3><pre>{trades}</pre></div>
+<div class='card'><b>Safety lock:</b> live/mainnet trading does not exist in this build. All executable exchange orders are restricted to Binance Spot Testnet.</div>
 </body></html>"""
