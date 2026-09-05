@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -36,7 +35,7 @@ MAX_HOLD_HOURS = max(1, int(os.getenv("MAX_HOLD_HOURS", "24")))
 if BOT_MODE not in {"paper", "testnet"}:
     raise RuntimeError("Safety lock: BOT_MODE supports only 'paper' or 'testnet'. Live/mainnet is intentionally unavailable.")
 
-app = FastAPI(title="Khafi Spot Bot v3")
+app = FastAPI(title="Khafi Spot Bot v3.1")
 
 exchange_args: dict[str, Any] = {
     "enableRateLimit": True,
@@ -47,11 +46,11 @@ if BOT_MODE == "testnet" and API_KEY and API_SECRET:
 
 ex = ccxt.binance(exchange_args)
 if BOT_MODE == "testnet":
-    # Must be called immediately after construction. This is the hard sandbox boundary.
+    # Hard safety boundary: every Binance call goes to Spot Testnet in testnet mode.
     ex.set_sandbox_mode(True)
 
 state: dict[str, Any] = {
-    "version": "v3",
+    "version": "v3.1",
     "mode": BOT_MODE,
     "execution_enabled": EXECUTE_TESTNET_ORDERS if BOT_MODE == "testnet" else False,
     "status": "starting",
@@ -65,6 +64,12 @@ state: dict[str, Any] = {
     "trades": [],
     "errors": [],
     "stats": {"wins": 0, "losses": 0, "closed": 0, "gross_profit": 0.0, "gross_loss": 0.0},
+    "auth": {
+        "configured": bool(API_KEY and API_SECRET),
+        "checked": False,
+        "ok": False,
+        "read_only_check": True,
+    },
     "preflight": {"ok": False, "symbols": {}, "auth_configured": bool(API_KEY and API_SECRET)},
 }
 
@@ -92,7 +97,8 @@ def ema_series(values: list[float], span: int) -> list[float]:
 def rsi_at(values: list[float], period: int, idx: int) -> float:
     if idx < period:
         return 50.0
-    gains, losses = [], []
+    gains: list[float] = []
+    losses: list[float] = []
     for i in range(idx - period + 1, idx + 1):
         d = values[i] - values[i - 1]
         gains.append(max(d, 0.0))
@@ -108,7 +114,7 @@ def rsi_at(values: list[float], period: int, idx: int) -> float:
 def atr_at(rows: list[list[Any]], period: int, idx: int) -> float:
     if idx < 1:
         return 0.0
-    trs = []
+    trs: list[float] = []
     for i in range(max(1, idx - period + 1), idx + 1):
         high = float(rows[i][2])
         low = float(rows[i][3])
@@ -138,7 +144,7 @@ def analyze(symbol: str, d15: list[list[Any]], d1h: list[list[Any]]) -> dict[str
     if len(d15) < 220 or len(d1h) < 220:
         return {"time": now_iso(), "symbol": symbol, "score": 0, "eligible": False, "reasons": ["not_enough_data"]}
 
-    i15 = len(d15) - 2  # only fully closed candle
+    i15 = len(d15) - 2
     i1h = len(d1h) - 2
     c15 = [float(r[4]) for r in d15[: i15 + 1]]
     c1h = [float(r[4]) for r in d1h[: i1h + 1]]
@@ -162,7 +168,6 @@ def analyze(symbol: str, d15: list[list[Any]], d1h: list[list[Any]]) -> dict[str
     score = 0.0
     reasons: list[str] = []
 
-    # Hard regime filter: do not buy against the 1h primary trend.
     regime_up = h50 > h200 and hprice > h50 and slope1h > 0
     if regime_up:
         score += 32
@@ -273,8 +278,8 @@ async def testnet_enter(sig: dict[str, Any]):
     if not EXECUTE_TESTNET_ORDERS:
         state["status"] = "testnet_signal_only"
         return
-    if not (API_KEY and API_SECRET):
-        state["status"] = "testnet_missing_api_credentials"
+    if not state["auth"].get("ok"):
+        state["status"] = "testnet_auth_not_verified"
         return
 
     market = ex.market(sig["symbol"])
@@ -323,8 +328,8 @@ async def close_position(price: float, reason: str):
         return
 
     if p.get("venue") == "binance_spot_testnet":
-        if not EXECUTE_TESTNET_ORDERS:
-            state["status"] = "testnet_exit_blocked_execution_disabled"
+        if not EXECUTE_TESTNET_ORDERS or not state["auth"].get("ok"):
+            state["status"] = "testnet_exit_blocked"
             return
         amount = float(ex.amount_to_precision(p["symbol"], p["base"]))
         await ex.create_market_sell_order(p["symbol"], amount)
@@ -401,8 +406,40 @@ async def scan():
             await enter(best)
 
 
+async def verify_testnet_auth() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "configured": bool(API_KEY and API_SECRET),
+        "checked": False,
+        "ok": False,
+        "read_only_check": True,
+        "sandbox": BOT_MODE == "testnet",
+    }
+    if BOT_MODE != "testnet":
+        result.update({"checked": True, "ok": True, "reason": "not_testnet_mode"})
+        return result
+    if not (API_KEY and API_SECRET):
+        result.update({"checked": True, "ok": False, "error": "credentials_missing"})
+        return result
+
+    try:
+        # fetch_balance is a private USER_DATA read. It does not create, cancel, buy or sell anything.
+        bal = await ex.fetch_balance()
+        total = bal.get("total") or {}
+        nonzero_assets = sum(1 for v in total.values() if isinstance(v, (int, float)) and float(v) != 0)
+        result.update({"checked": True, "ok": True, "nonzero_asset_count": nonzero_assets})
+    except Exception as e:
+        result.update({"checked": True, "ok": False, "error": f"{type(e).__name__}: {str(e)[:180]}"})
+    return result
+
+
 async def run_preflight():
-    pf = {"ok": True, "symbols": {}, "auth_configured": bool(API_KEY and API_SECRET), "sandbox": BOT_MODE == "testnet"}
+    pf: dict[str, Any] = {
+        "ok": True,
+        "symbols": {},
+        "auth_configured": bool(API_KEY and API_SECRET),
+        "sandbox": BOT_MODE == "testnet",
+        "execution_enabled": EXECUTE_TESTNET_ORDERS if BOT_MODE == "testnet" else False,
+    }
     try:
         markets = await ex.load_markets()
         for sym in SYMBOLS:
@@ -419,13 +456,20 @@ async def run_preflight():
                     "min_amount": (limits.get("amount") or {}).get("min"),
                     "min_cost": (limits.get("cost") or {}).get("min"),
                 }
-        if BOT_MODE == "testnet" and EXECUTE_TESTNET_ORDERS and not (API_KEY and API_SECRET):
+
+        state["auth"] = await verify_testnet_auth()
+        pf["auth_ok"] = state["auth"].get("ok")
+        if BOT_MODE == "testnet" and not state["auth"].get("ok"):
             pf["ok"] = False
-            pf["auth_error"] = "execution_enabled_but_credentials_missing"
+            pf["auth_error"] = state["auth"].get("error", "auth_failed")
     except Exception as e:
         pf["ok"] = False
-        pf["error"] = str(e)[:250]
+        pf["error"] = f"{type(e).__name__}: {str(e)[:220]}"
+
     state["preflight"] = pf
+    # Safe diagnostics only: no keys, no secrets, no balance amounts.
+    print(f"[khafi-preflight] {pf}", flush=True)
+    print(f"[khafi-auth] {state['auth']}", flush=True)
 
 
 async def loop():
@@ -464,7 +508,21 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": state["version"], "mode": BOT_MODE, "status": state["status"], "execution_enabled": state["execution_enabled"]}
+    return {
+        "ok": True,
+        "version": state["version"],
+        "mode": BOT_MODE,
+        "status": state["status"],
+        "execution_enabled": state["execution_enabled"],
+        "auth_ok": state["auth"].get("ok"),
+    }
+
+
+@app.get("/auth-check")
+async def auth_check():
+    # Re-run the same read-only private authentication check on demand.
+    state["auth"] = await verify_testnet_auth()
+    return state["auth"]
 
 
 @app.get("/preflight")
@@ -498,18 +556,17 @@ async def home():
     mode_label = "PAPER — no real orders" if BOT_MODE == "paper" else ("BINANCE SPOT TESTNET — execution ON" if EXECUTE_TESTNET_ORDERS else "BINANCE SPOT TESTNET — signal only")
     return f"""<!doctype html>
 <html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Khafi Spot Bot v3</title>
+<title>Khafi Spot Bot v3.1</title>
 <style>
 body{{font-family:system-ui;max-width:820px;margin:24px;background:#fafafa;color:#171717}}
 .card{{padding:16px;border:1px solid #ddd;border-radius:16px;background:white;margin:12px 0}}
 pre{{white-space:pre-wrap;word-break:break-word;font-size:12px}}
-.good{{font-weight:700}} .warn{{font-weight:700}}
 </style></head><body>
-<h1>Khafi Spot Bot v3</h1>
-<div class='card'><b>Mode:</b> {mode_label}<br><b>Status:</b> {state['status']}<br><b>Symbols:</b> {', '.join(SYMBOLS)}<br><b>Preflight:</b> {state['preflight'].get('ok')}</div>
+<h1>Khafi Spot Bot v3.1</h1>
+<div class='card'><b>Mode:</b> {mode_label}<br><b>Status:</b> {state['status']}<br><b>Symbols:</b> {', '.join(SYMBOLS)}<br><b>Preflight:</b> {state['preflight'].get('ok')}<br><b>API auth verified:</b> {state['auth'].get('ok')}</div>
 <div class='card'><b>Paper balance:</b> {state['paper_balance']:.2f}<br><b>Realized PnL:</b> {state['realized_pnl']:.4f}<br><b>Closed:</b> {st['closed']} &nbsp; <b>Wins:</b> {st['wins']} &nbsp; <b>Losses:</b> {st['losses']}</div>
 <div class='card'><h3>Open position</h3><pre>{p}</pre></div>
 <div class='card'><h3>Last signal</h3><pre>{sig}</pre></div>
 <div class='card'><h3>Last trades</h3><pre>{trades}</pre></div>
-<div class='card'><b>Safety lock:</b> this code has no Binance mainnet/live trading mode. Test execution is restricted to Binance Spot Testnet.</div>
+<div class='card'><b>Safety lock:</b> live/mainnet trading does not exist in this build. Test execution is restricted to Binance Spot Testnet.</div>
 </body></html>"""
