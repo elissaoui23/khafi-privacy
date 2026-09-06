@@ -1,20 +1,28 @@
 {
-  "version": "gha-v1",
-  "status": "not_started",
   "day_key": null,
   "day_realized_pnl": 0.0,
-  "realized_pnl_total": 0.0,
-  "position": null,
-  "last_trade_at": null,
+  "errors": [
+    {
+      "error": "binance GET https://testnet.binance.vision/api/v3/exchangeInfo 451  {\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contac",
+      "time": "2026-09-06T15:37:42.236973+00:00",
+      "type": "ExchangeNotAvailable",
+      "where": "run"
+    }
+  ],
   "last_scan_candle": null,
   "last_signal": null,
+  "last_trade_at": null,
+  "position": null,
+  "realized_pnl_total": 0.0,
   "stats": {
-    "wins": 0,
-    "losses": 0,
     "closed": 0,
+    "gross_loss": 0.0,
     "gross_profit": 0.0,
-    "gross_loss": 0.0
+    "losses": 0,
+    "wins": 0
   },
+  "status": "error:ExchangeNotAvailable",
   "trades": [],
-  "errors": []
+  "updated_at": "2026-09-06T15:37:42.236987+00:00",
+  "version": "gha-v1"
 }
