@@ -7,6 +7,12 @@
       "time": "2026-09-06T15:37:42.236973+00:00",
       "type": "ExchangeNotAvailable",
       "where": "run"
+    },
+    {
+      "error": "binance GET https://testnet.binance.vision/api/v3/exchangeInfo 451  {\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contac",
+      "time": "2026-09-06T15:38:02.890745+00:00",
+      "type": "ExchangeNotAvailable",
+      "where": "run"
     }
   ],
   "last_scan_candle": null,
@@ -23,6 +29,6 @@
   },
   "status": "error:ExchangeNotAvailable",
   "trades": [],
-  "updated_at": "2026-09-06T15:37:42.236987+00:00",
+  "updated_at": "2026-09-06T15:38:02.890758+00:00",
   "version": "gha-v1"
 }
