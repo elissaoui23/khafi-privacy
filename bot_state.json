@@ -1,0 +1,20 @@
+{
+  "version": "gha-v1",
+  "status": "not_started",
+  "day_key": null,
+  "day_realized_pnl": 0.0,
+  "realized_pnl_total": 0.0,
+  "position": null,
+  "last_trade_at": null,
+  "last_scan_candle": null,
+  "last_signal": null,
+  "stats": {
+    "wins": 0,
+    "losses": 0,
+    "closed": 0,
+    "gross_profit": 0.0,
+    "gross_loss": 0.0
+  },
+  "trades": [],
+  "errors": []
+}
